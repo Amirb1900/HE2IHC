@@ -53,7 +53,7 @@ torch.backends.cudnn.benchmark = False
 # 2. Paths
 # ============================================================
 
-data_dir = "/kaggle/input/resized-bci-512/512BCI_dataset"
+data_dir = "/kaggle/input/datasets/amirb1900/resized-bci-512/512BCI_dataset"
 
 RESULT_DIR = "/kaggle/working/transpath_results"
 FEATURE_DIR = RESULT_DIR
@@ -166,6 +166,13 @@ model = timm.create_model(
 )
 
 model = model.to(device)
+
+# Preserve the original pretrained MoCo v3 initialization BEFORE fine-tuning.
+# CPU copies avoid retaining a second full model on the GPU.
+pretrained_model_state = {
+    key: value.detach().cpu().clone()
+    for key, value in model.state_dict().items()
+}
 
 print("\nModel loaded.")
 print("Embedding dimension: 384")
@@ -1038,7 +1045,8 @@ def extract_features(
     split_name,
     transform,
     device,
-    batch_size=32
+    batch_size=32,
+    feature_source="fine-tuned TransPath backbone before classification head"
 ):
 
     dataset = FeatureDataset(
@@ -1180,10 +1188,7 @@ def extract_features(
 
         "model_name": MODEL_NAME,
 
-        "feature_source": (
-            "fine-tuned TransPath backbone "
-            "before classification head"
-        )
+        "feature_source": feature_source
     }
 
     print(
@@ -1204,7 +1209,131 @@ def extract_features(
 
 
 # ============================================================
-# 24. Extract Train / Val / Test Features
+# 24A. Extract features from ORIGINAL pretrained MoCo v3 weights
+# ============================================================
+
+# This is the no-classification-fine-tuning baseline. The classification
+# head is not used by forward_features; only the pretrained backbone tokens
+# are extracted here.
+model.load_state_dict(pretrained_model_state)
+model.eval()
+
+PRETRAINED_FEATURE_DIR = os.path.join(RESULT_DIR, "pretrained_features")
+os.makedirs(PRETRAINED_FEATURE_DIR, exist_ok=True)
+
+pretrained_train_features = extract_features(
+    model=model,
+    dataframe=train_df,
+    split_name="train (pretrained)",
+    transform=eval_tfms,
+    device=device,
+    feature_source="original pretrained TransPath MoCo v3 backbone; no HER2 fine-tuning"
+)
+
+pretrained_val_features = extract_features(
+    model=model,
+    dataframe=val_df,
+    split_name="val (pretrained)",
+    transform=eval_tfms,
+    device=device,
+    feature_source="original pretrained TransPath MoCo v3 backbone; no HER2 fine-tuning"
+)
+
+pretrained_test_features = extract_features(
+    model=model,
+    dataframe=test_df,
+    split_name="test (pretrained)",
+    transform=eval_tfms,
+    device=device,
+    feature_source="original pretrained TransPath MoCo v3 backbone; no HER2 fine-tuning"
+)
+
+pretrained_split_features = {
+    "train": pretrained_train_features,
+    "val": pretrained_val_features,
+    "test": pretrained_test_features,
+}
+
+for split_name, feature_dict in pretrained_split_features.items():
+    torch.save(
+        feature_dict,
+        os.path.join(PRETRAINED_FEATURE_DIR, f"{split_name}_features.pt")
+    )
+    np.savez_compressed(
+        os.path.join(PRETRAINED_FEATURE_DIR, f"{split_name}_features.npz"),
+        cls_features=feature_dict["cls_features"].numpy(),
+        patch_features=feature_dict["patch_features"].numpy(),
+        labels=feature_dict["labels"].numpy(),
+    )
+
+pretrained_all_features = {
+    "cls_features": torch.cat([
+        pretrained_train_features["cls_features"],
+        pretrained_val_features["cls_features"],
+        pretrained_test_features["cls_features"],
+    ], dim=0),
+    "patch_features": torch.cat([
+        pretrained_train_features["patch_features"],
+        pretrained_val_features["patch_features"],
+        pretrained_test_features["patch_features"],
+    ], dim=0),
+    "labels": torch.cat([
+        pretrained_train_features["labels"],
+        pretrained_val_features["labels"],
+        pretrained_test_features["labels"],
+    ], dim=0),
+    "label_names": (pretrained_train_features["label_names"] +
+                    pretrained_val_features["label_names"] +
+                    pretrained_test_features["label_names"]),
+    "filenames": (pretrained_train_features["filenames"] +
+                  pretrained_val_features["filenames"] +
+                  pretrained_test_features["filenames"]),
+    "paths": (pretrained_train_features["paths"] +
+              pretrained_val_features["paths"] +
+              pretrained_test_features["paths"]),
+    "splits": (pretrained_train_features["splits"] +
+               pretrained_val_features["splits"] +
+               pretrained_test_features["splits"]),
+    "feature_dim": pretrained_train_features["feature_dim"],
+    "num_patch_tokens": pretrained_train_features["num_patch_tokens"],
+    "patch_grid_size": (14, 14),
+    "model_name": MODEL_NAME,
+    "feature_source": "original pretrained TransPath MoCo v3 backbone; no HER2 fine-tuning",
+}
+
+pretrained_sample_indices = np.arange(len(pretrained_all_features["labels"]))
+pretrained_all_features["sample_index"] = pretrained_sample_indices
+
+torch.save(
+    pretrained_all_features,
+    os.path.join(PRETRAINED_FEATURE_DIR, "all_features.pt")
+)
+np.savez_compressed(
+    os.path.join(PRETRAINED_FEATURE_DIR, "all_features.npz"),
+    cls_features=pretrained_all_features["cls_features"].numpy(),
+    patch_features=pretrained_all_features["patch_features"].numpy(),
+    labels=pretrained_all_features["labels"].numpy(),
+    sample_index=pretrained_sample_indices,
+)
+
+pretrained_metadata_df = pd.DataFrame({
+    "sample_index": pretrained_sample_indices,
+    "filename": pretrained_all_features["filenames"],
+    "path": pretrained_all_features["paths"],
+    "split": pretrained_all_features["splits"],
+    "label": pretrained_all_features["labels"].numpy(),
+    "label_name": pretrained_all_features["label_names"],
+})
+pretrained_metadata_df.to_csv(
+    os.path.join(PRETRAINED_FEATURE_DIR, "metadata.csv"), index=False
+)
+
+# Restore the best HER2-fine-tuned checkpoint, then extract the second feature set.
+model.load_state_dict(best_model_wts)
+model.eval()
+
+# ============================================================
+# 24B. Extract Train / Val / Test Features from fine-tuned backbone
 # ============================================================
 
 train_features = extract_features(
@@ -1474,7 +1603,7 @@ metadata_df.to_csv(
 # ============================================================
 
 README_TEXT = f"""
-TransPath HER2 Feature Extraction
+TransPath HER2 Classification and Dual Feature Extraction
 =================================
 
 Model:
@@ -1519,9 +1648,16 @@ Integer labels:
 2  -> 2+
 3  -> 3+
 
-Important:
-Features were extracted from the fine-tuned TransPath
-backbone BEFORE the classification head.
+Feature variants
+----------------
+1. Files in the root result directory (e.g. train_features.pt) were
+   extracted from the HER2-fine-tuned TransPath backbone before its classifier head.
+2. Files under pretrained_features/ were extracted from the original pretrained
+   TransPath MoCo v3 backbone without HER2 fine-tuning.
+
+Both variants contain CLS and spatial patch tokens. Compare them in the downstream
+paired H&E-to-IHC LDM experiment; HER2 classification metrics alone do not establish
+which feature representation produces better IHC images.
 
 Preprocessing during feature extraction:
 Deterministic evaluation preprocessing.
@@ -1530,18 +1666,12 @@ No random augmentation.
 Files
 -----
 
-train_features.pt
-val_features.pt
-test_features.pt
+train_features.pt / val_features.pt / test_features.pt (fine-tuned)
+train_features.npz / val_features.npz / test_features.npz (fine-tuned)
+all_features.pt / all_features.npz / metadata.csv (fine-tuned)
 
-train_features.npz
-val_features.npz
-test_features.npz
-
-all_features.pt
-all_features.npz
-
-metadata.csv
+pretrained_features/ contains the same split and combined files extracted from
+the original pretrained backbone without HER2 fine-tuning.
 
 The row/sample correspondence is defined by sample_index.
 
