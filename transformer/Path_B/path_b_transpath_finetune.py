@@ -527,6 +527,7 @@ def train_model(
     best_checkpoint = torch.load(
         checkpoint_path,
         map_location=DEVICE,
+        weights_only=False,
     )
 
     backbone.load_state_dict(best_checkpoint["backbone_state_dict"])
