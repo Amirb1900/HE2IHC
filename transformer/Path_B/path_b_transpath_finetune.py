@@ -411,7 +411,10 @@ def train_model(
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # Compatible with CUDA mixed-precision training.
-    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=USE_AMP,
+    )
 
     best_macro_f1 = -1.0
     best_epoch = 0
@@ -431,7 +434,10 @@ def train_model(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=USE_AMP):
+            with torch.amp.autocast(
+                device_type="cuda",
+                enabled=USE_AMP,
+            ):
                 if train_backbone:
                     features = get_cls_features(backbone, images)
                 else:
