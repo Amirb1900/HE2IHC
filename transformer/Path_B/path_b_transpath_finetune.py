@@ -275,7 +275,7 @@ def evaluate(backbone, head, loader):
         images = images.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=USE_AMP):
+        with torch.amp.autocast(device_type="cuda", enabled=USE_AMP):
             features = get_cls_features(backbone, images)
             logits = head(features)
 
