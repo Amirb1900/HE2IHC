@@ -1,7 +1,8 @@
 # ============================================================
-# CTransPath — BCI HER2 Classification
-# Independent Kaggle experiment
-# Pretrained CTransPath + end-to-end fine-tuning
+# CTransPath — Path B: End-to-End Fine-Tuning
+# Dataset: BCI HER2 H&E images
+# Classes: 0, 1+, 2+, 3+
+# Environment: Kaggle / PyTorch / CUDA
 # ============================================================
 
 import os
@@ -9,298 +10,309 @@ import sys
 import json
 import time
 import random
-import subprocess
 import warnings
+import subprocess
 from pathlib import Path
-
-warnings.filterwarnings("ignore")
-
-# ============================================================
-# 1. INSTALL / IMPORT DEPENDENCIES
-# ============================================================
-
-def install_package(package):
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", package],
-        check=True
-    )
-
-install_package("gdown")
-install_package("scikit-learn")
-install_package("seaborn")
-install_package("timm")
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+from PIL import Image
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image
 
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     f1_score,
+    precision_score,
+    recall_score,
     classification_report,
-    confusion_matrix
+    confusion_matrix,
+    ConfusionMatrixDisplay,
 )
 
-print("=" * 70)
-print("ENVIRONMENT")
-print("=" * 70)
-print("PyTorch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
+import matplotlib.pyplot as plt
 
-if not torch.cuda.is_available():
-    raise RuntimeError(
-        "GPU is not available. Enable GPU in Kaggle Settings > Accelerator."
-    )
+warnings.filterwarnings("ignore")
 
-DEVICE = torch.device("cuda")
-print("GPU:", torch.cuda.get_device_name(0))
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+SEED = 42
+
+DATA_ROOT = Path(
+    "/kaggle/input/datasets/amirb1900/"
+    "resized-bci-512/512BCI_dataset"
+)
+
+OUTPUT_ROOT = Path(
+    "/kaggle/working/ctranspath_path_b"
+)
+
+RESULTS_DIR = OUTPUT_ROOT / "results"
+CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+BEST_MODEL_PATH = CHECKPOINT_DIR / "best_ctranspath_path_b.pth"
+LAST_MODEL_PATH = CHECKPOINT_DIR / "last_ctranspath_path_b.pth"
+
+HISTORY_PATH = RESULTS_DIR / "training_history.csv"
+METRICS_PATH = RESULTS_DIR / "test_metrics.json"
+REPORT_PATH = RESULTS_DIR / "classification_report.txt"
+PREDICTIONS_PATH = RESULTS_DIR / "test_predictions.csv"
+CONFUSION_MATRIX_PATH = RESULTS_DIR / "confusion_matrix.png"
+
+CLASS_NAMES = ["0", "1+", "2+", "3+"]
+
+LABEL_TO_ID = {
+    "0": 0,
+    "1+": 1,
+    "2+": 2,
+    "3+": 3,
+}
+
+NUM_CLASSES = len(CLASS_NAMES)
+
+IMAGE_SIZE = 224
+BATCH_SIZE = 16
+
+NUM_EPOCHS = 25
+PATIENCE = 7
+
+BACKBONE_LR = 1e-5
+CLASSIFIER_LR = 1e-4
+
+WEIGHT_DECAY = 1e-4
+NUM_WORKERS = 2
+
+# Keep the same unweighted CrossEntropyLoss protocol.
+# No class weights or oversampling are applied.
+USE_CLASS_WEIGHTS = False
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+USE_AMP = DEVICE.type == "cuda"
 
 
 # ============================================================
 # 2. REPRODUCIBILITY
 # ============================================================
 
-SEED = 42
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
 
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+    torch.manual_seed(seed)
 
-torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-# ============================================================
-# 3. PATHS AND CONFIGURATION
-# ============================================================
+set_seed(SEED)
 
-DATA_DIR = Path(
-    "/kaggle/input/datasets/amirb1900/resized-bci-512/512BCI_dataset"
-)
+print("=" * 70)
+print("ENVIRONMENT")
+print("=" * 70)
 
-WORK_DIR = Path("/kaggle/working/ctranspath_path_b")
-REPO_DIR = WORK_DIR / "TransPath"
-CHECKPOINT_PATH = WORK_DIR / "ctranspath.pth"
-OUTPUT_DIR = WORK_DIR / "results"
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
 
-BEST_CHECKPOINT = OUTPUT_DIR / "best_ctranspath_checkpoint.pt"
-HISTORY_PATH = OUTPUT_DIR / "training_history.csv"
-
-CLASS_NAMES = ["0", "1+", "2+", "3+"]
-LABEL_TO_ID = {name: idx for idx, name in enumerate(CLASS_NAMES)}
-ID_TO_LABEL = {idx: name for name, idx in LABEL_TO_ID.items()}
-
-IMAGE_SIZE = 224
-BATCH_SIZE = 16
-NUM_WORKERS = 2
-
-EPOCHS = 20
-PATIENCE = 5
-
-BACKBONE_LR = 1e-5
-CLASSIFIER_LR = 1e-4
-WEIGHT_DECAY = 1e-4
-
-# Keep this consistent with the previous Path B protocol.
-# Set True only if Path B also used class-weighted CrossEntropy.
-USE_CLASS_WEIGHTS = False
-
-# Official CTransPath checkpoint from the repository README.
-CHECKPOINT_URL = (
-    "https://drive.google.com/uc?id=1DoDx_70_TLj98gTf6YTXnu4tFhsFocDX"
-)
-
-print("\nOutput directory:", OUTPUT_DIR)
+print("Device:", DEVICE)
+print("Output directory:", OUTPUT_ROOT)
+print("Results directory:", RESULTS_DIR)
 
 
 # ============================================================
-# 4. DOWNLOAD OFFICIAL CTRanSPATH REPOSITORY AND CHECKPOINT
+# 3. CHECK DATASET STRUCTURE
 # ============================================================
 
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_HE_DIR = DATA_ROOT / "train" / "train" / "HE"
+VAL_HE_DIR = DATA_ROOT / "val" / "val" / "HE"
+TEST_HE_DIR = DATA_ROOT / "test" / "test" / "HE"
 
-if not (REPO_DIR / "ctran.py").exists():
-    print("\nCloning official TransPath repository...")
-
-    subprocess.run(
-        [
-            "git", "clone",
-            "https://github.com/Xiyue-Wang/TransPath.git",
-            str(REPO_DIR)
-        ],
-        check=True
-    )
-else:
-    print("Repository already exists.")
-
-sys.path.insert(0, str(REPO_DIR))
-
-if not (REPO_DIR / "ctran.py").exists():
-    raise FileNotFoundError(
-        f"ctran.py not found in {REPO_DIR}"
-    )
-
-if not CHECKPOINT_PATH.exists():
-    print("\nDownloading pretrained CTransPath checkpoint...")
-
-    subprocess.run(
-        [
-            sys.executable, "-m", "gdown",
-            CHECKPOINT_URL,
-            "-O", str(CHECKPOINT_PATH)
-        ],
-        check=True
-    )
-
-if (
-    not CHECKPOINT_PATH.exists()
-    or CHECKPOINT_PATH.stat().st_size < 1_000_000
-):
-    raise RuntimeError(
-        "Checkpoint download failed or the file is unexpectedly small. "
-        "Check Kaggle Internet access and the official download link."
-    )
-
-print(
-    "Checkpoint size:",
-    round(CHECKPOINT_PATH.stat().st_size / (1024 ** 2), 2),
-    "MB"
-)
-
-from ctran import ctranspath
-
-
-# ============================================================
-# 5. LOAD DATASET
-# ============================================================
-
-def collect_split(split):
-    image_dir = DATA_DIR / split / split / "HE"
-
-    if not image_dir.exists():
+for directory in [TRAIN_HE_DIR, VAL_HE_DIR, TEST_HE_DIR]:
+    if not directory.is_dir():
         raise FileNotFoundError(
-            f"Image directory not found: {image_dir}"
+            f"Dataset directory not found: {directory}"
         )
 
-    rows = []
+print("\n" + "=" * 70)
+print("DATASET DIRECTORIES")
+print("=" * 70)
+
+print("Train:", TRAIN_HE_DIR)
+print("Validation:", VAL_HE_DIR)
+print("Test:", TEST_HE_DIR)
+
+
+# ============================================================
+# 4. READ FILENAMES AND LABELS
+# ============================================================
+
+def collect_images(image_dir):
+    """
+    Extract labels from the suffix after the final underscore.
+
+    Examples:
+        00003_train_1+.png -> 1+
+        sample_2+.png      -> 2+
+        sample_0.png       -> 0
+
+    This parser does not assume that the filename contains
+    only one underscore.
+    """
 
     image_paths = sorted(
         p for p in image_dir.iterdir()
         if p.is_file() and p.suffix.lower() == ".png"
     )
 
-    if not image_paths:
-        raise RuntimeError(
-            f"No PNG images found in {image_dir}"
-        )
+    records = []
+    invalid_files = []
 
     for path in image_paths:
-        # Examples:
-        # 00003_train_1+.png -> 1+
-        # 00010_2+.png       -> 2+
         label_name = path.stem.rsplit("_", 1)[-1]
 
         if label_name not in LABEL_TO_ID:
-            raise ValueError(
-                f"Unexpected label '{label_name}' in {path.name}"
+            invalid_files.append(
+                (path.name, label_name)
             )
+            continue
 
-        rows.append({
-            "filename": str(path),
-            "image_name": path.name,
+        records.append({
+            "path": str(path),
+            "filename": path.name,
             "label_name": label_name,
-            "label": LABEL_TO_ID[label_name]
+            "label": LABEL_TO_ID[label_name],
         })
 
-    return pd.DataFrame(rows)
+    if invalid_files:
+        examples = invalid_files[:10]
+
+        raise ValueError(
+            f"Could not parse labels for "
+            f"{len(invalid_files)} files in {image_dir}.\n"
+            f"Examples: {examples}"
+        )
+
+    if not records:
+        raise RuntimeError(
+            f"No valid PNG images found in {image_dir}"
+        )
+
+    return pd.DataFrame(records)
 
 
-train_df = collect_split("train")
-val_df = collect_split("val")
-test_df = collect_split("test")
+train_df = collect_images(TRAIN_HE_DIR)
+val_df = collect_images(VAL_HE_DIR)
+test_df = collect_images(TEST_HE_DIR)
 
-EXPECTED_COUNTS = {
-    "train": 3396,
-    "val": 500,
-    "test": 977
-}
 
-actual_counts = {
-    "train": len(train_df),
-    "val": len(val_df),
-    "test": len(test_df)
-}
-
-print("\n" + "=" * 70)
-print("DATASET SUMMARY")
-print("=" * 70)
-
-for split_name, df in [
-    ("Train", train_df),
-    ("Validation", val_df),
-    ("Test", test_df)
-]:
-    print(f"\n{split_name}: {len(df)} images")
-
+def print_split_summary(name, df):
     counts = (
         df["label_name"]
         .value_counts()
         .reindex(CLASS_NAMES, fill_value=0)
     )
 
+    print(f"\n{name}: {len(df)} images")
     print("Class counts:", counts.to_dict())
 
-if actual_counts != EXPECTED_COUNTS:
-    raise RuntimeError(
-        "Dataset counts differ from the expected counts. "
-        f"Expected={EXPECTED_COUNTS}, actual={actual_counts}. "
-        "Check dataset paths and label parsing before continuing."
-    )
 
-print("\nDataset count checks passed.")
+print("\n" + "=" * 70)
+print("DATASET SUMMARY")
+print("=" * 70)
+
+print_split_summary("Train", train_df)
+print_split_summary("Validation", val_df)
+print_split_summary("Test", test_df)
+
+assert set(train_df["label"].unique()).issubset(
+    set(range(NUM_CLASSES))
+)
+
+assert set(val_df["label"].unique()).issubset(
+    set(range(NUM_CLASSES))
+)
+
+assert set(test_df["label"].unique()).issubset(
+    set(range(NUM_CLASSES))
+)
+
+# Detect accidental filename overlap between splits.
+train_paths = set(train_df["path"])
+val_paths = set(val_df["path"])
+test_paths = set(test_df["path"])
+
+assert train_paths.isdisjoint(val_paths), (
+    "Train and validation contain overlapping paths."
+)
+
+assert train_paths.isdisjoint(test_paths), (
+    "Train and test contain overlapping paths."
+)
+
+assert val_paths.isdisjoint(test_paths), (
+    "Validation and test contain overlapping paths."
+)
+
+print("\nDataset count and split checks passed.")
 
 
 # ============================================================
-# 6. TRANSFORMS
+# 5. IMAGE TRANSFORMS
 # ============================================================
 
-# Official CTransPath feature-extraction preprocessing uses
-# Resize(224), ToTensor(), and ImageNet normalization.
-# Train uses horizontal/vertical flips as mild augmentation.
-
-mean = (0.485, 0.456, 0.406)
-std = (0.229, 0.224, 0.225)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 train_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
+    transforms.Resize(
+        (IMAGE_SIZE, IMAGE_SIZE)
+    ),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=90),
     transforms.ToTensor(),
-    transforms.Normalize(mean=mean, std=std)
+    transforms.Normalize(
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD,
+    ),
 ])
 
 eval_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
+    transforms.Resize(
+        (IMAGE_SIZE, IMAGE_SIZE)
+    ),
     transforms.ToTensor(),
-    transforms.Normalize(mean=mean, std=std)
+    transforms.Normalize(
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD,
+    ),
 ])
 
 
 # ============================================================
-# 7. DATASET AND DATALOADERS
+# 6. PYTORCH DATASET
 # ============================================================
 
 class BCIDataset(Dataset):
+
     def __init__(self, dataframe, transform=None):
         self.df = dataframe.reset_index(drop=True)
         self.transform = transform
@@ -308,387 +320,620 @@ class BCIDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+    def __getitem__(self, index):
+        row = self.df.iloc[index]
 
-        with Image.open(row["filename"]) as image:
+        image_path = row["path"]
+        label = int(row["label"])
+
+        with Image.open(image_path) as image:
             image = image.convert("RGB")
 
         if self.transform is not None:
             image = self.transform(image)
 
-        label = int(row["label"])
-
         return image, label
 
 
-train_ds = BCIDataset(train_df, train_transform)
-val_ds = BCIDataset(val_df, eval_transform)
-test_ds = BCIDataset(test_df, eval_transform)
+train_dataset = BCIDataset(
+    train_df,
+    transform=train_transform,
+)
+
+val_dataset = BCIDataset(
+    val_df,
+    transform=eval_transform,
+)
+
+test_dataset = BCIDataset(
+    test_df,
+    transform=eval_transform,
+)
+
+
+# ============================================================
+# 7. DATA LOADERS
+# ============================================================
 
 train_loader = DataLoader(
-    train_ds,
+    train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=False
+    pin_memory=USE_AMP,
+    drop_last=False,
+    persistent_workers=NUM_WORKERS > 0,
 )
 
 val_loader = DataLoader(
-    val_ds,
+    val_dataset,
     batch_size=BATCH_SIZE,
     shuffle=False,
     num_workers=NUM_WORKERS,
-    pin_memory=True
+    pin_memory=USE_AMP,
+    drop_last=False,
+    persistent_workers=NUM_WORKERS > 0,
 )
 
 test_loader = DataLoader(
-    test_ds,
+    test_dataset,
     batch_size=BATCH_SIZE,
     shuffle=False,
     num_workers=NUM_WORKERS,
-    pin_memory=True
+    pin_memory=USE_AMP,
+    drop_last=False,
+    persistent_workers=NUM_WORKERS > 0,
 )
 
+
+# Verify image and label shapes before loading the model.
 sample_images, sample_labels = next(iter(train_loader))
 
-print("\nBatch image shape:", tuple(sample_images.shape))
-print("Batch label shape:", tuple(sample_labels.shape))
-
-
-# ============================================================
-# 8. LOAD PRETRAINED CTRanSPATH
-# ============================================================
-
 print("\n" + "=" * 70)
-print("LOADING PRETRAINED CTRanSPATH")
+print("BATCH CHECK")
 print("=" * 70)
 
-# Build the official architecture.
-backbone = ctranspath()
+print("Batch image shape:", tuple(sample_images.shape))
+print("Batch label shape:", tuple(sample_labels.shape))
+print("Batch label values:", sample_labels.tolist())
 
-# Remove the original classification head.
-backbone.head = nn.Identity()
+assert sample_images.ndim == 4
+assert sample_images.shape[1] == 3
+assert sample_images.shape[-2:] == (IMAGE_SIZE, IMAGE_SIZE)
 
-# Explicit weights_only=False supports checkpoints containing
-# metadata in addition to tensors. Only load this trusted official file.
+
+# ============================================================
+# 8. CTransPath CUSTOM CONVOLUTIONAL STEM
+# ============================================================
+
+# This implementation follows the CTransPath ConvStem design.
+# It accepts additional keyword arguments used by newer timm
+# versions and returns NHWC features expected by SwinTransformer.
+
 try:
-    checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location="cpu",
-        weights_only=False
-    )
-except TypeError:
-    checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location="cpu"
-    )
+    import timm
+    from timm.layers import to_2tuple
+except ImportError as exc:
+    raise ImportError(
+        "Could not import timm or timm.layers.to_2tuple. "
+        "Check the Kaggle environment before proceeding."
+    ) from exc
 
-if not isinstance(checkpoint, dict) or "model" not in checkpoint:
-    raise KeyError(
-        "Expected the official checkpoint to contain a 'model' key. "
-        f"Available keys: {list(checkpoint.keys()) if isinstance(checkpoint, dict) else type(checkpoint)}"
-    )
 
-# Do not silently ignore missing or unexpected weights.
-load_result = backbone.load_state_dict(
-    checkpoint["model"],
-    strict=True
-)
+print("\n" + "=" * 70)
+print("TIMM VERSION")
+print("=" * 70)
 
-print("Official pretrained weights loaded.")
-print(load_result)
+print("timm:", timm.__version__)
 
-backbone = backbone.to(DEVICE)
 
-# Determine feature dimension using a real forward pass.
-backbone.eval()
+class ConvStem(nn.Module):
 
-with torch.no_grad():
-    dummy = torch.zeros(
-        2, 3, IMAGE_SIZE, IMAGE_SIZE,
-        device=DEVICE
-    )
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=4,
+        in_chans=3,
+        embed_dim=96,
+        norm_layer=None,
+        **kwargs,
+    ):
+        super().__init__()
 
-    dummy_features = backbone(dummy)
+        if patch_size != 4:
+            raise ValueError(
+                "CTransPath ConvStem requires patch_size=4."
+            )
 
-    if dummy_features.ndim > 2:
-        dummy_features = torch.flatten(
-            dummy_features, start_dim=1
+        if embed_dim % 8 != 0:
+            raise ValueError(
+                "embed_dim must be divisible by 8."
+            )
+
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+
+        self.grid_size = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
         )
 
-    FEATURE_DIM = int(dummy_features.shape[1])
+        self.num_patches = (
+            self.grid_size[0] * self.grid_size[1]
+        )
 
-print("Feature tensor shape:", tuple(dummy_features.shape))
+        stem_layers = []
+
+        input_dim = in_chans
+        output_dim = embed_dim // 8
+
+        for _ in range(2):
+            stem_layers.extend([
+                nn.Conv2d(
+                    input_dim,
+                    output_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(output_dim),
+                nn.ReLU(inplace=True),
+            ])
+
+            input_dim = output_dim
+            output_dim *= 2
+
+        stem_layers.append(
+            nn.Conv2d(
+                input_dim,
+                embed_dim,
+                kernel_size=1,
+            )
+        )
+
+        self.proj = nn.Sequential(*stem_layers)
+
+        self.norm = (
+            norm_layer(embed_dim)
+            if norm_layer is not None
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.shape
+
+        if (
+            height != self.img_size[0]
+            or width != self.img_size[1]
+        ):
+            raise ValueError(
+                f"Expected image size {self.img_size}, "
+                f"received {(height, width)}."
+            )
+
+        x = self.proj(x)
+
+        # BCHW -> BHWC, as expected by SwinTransformer.
+        x = x.permute(0, 2, 3, 1)
+
+        x = self.norm(x)
+
+        return x
+
+
+# ============================================================
+# 9. LOAD PRETRAINED CTransPath BACKBONE
+# ============================================================
+
+# This is the timm-compatible Hugging Face model.
+# It is not the original Google Drive checkpoint.
+#
+# The model is loaded with pretrained=True BEFORE replacing
+# its original classification head.
+
+MODEL_ID = (
+    "hf-hub:1aurent/"
+    "swin_tiny_patch4_window7_224.CTransPath"
+)
+
+print("\n" + "=" * 70)
+print("LOADING PRETRAINED CTransPath")
+print("=" * 70)
+
+print("Model ID:", MODEL_ID)
+print("Downloading/loading pretrained weights if needed...")
+
+try:
+    backbone = timm.create_model(
+        MODEL_ID,
+        pretrained=True,
+        embed_layer=ConvStem,
+    )
+except Exception as exc:
+    raise RuntimeError(
+        "CTransPath could not be loaded from Hugging Face. "
+        "Check that Kaggle Internet is enabled and inspect "
+        "the complete underlying exception. Do not start "
+        "training with randomly initialized weights."
+    ) from exc
+
+
+# Remove the original classification head only after the
+# pretrained model has loaded successfully.
+if not hasattr(backbone, "head"):
+    raise AttributeError(
+        "The loaded model has no 'head' attribute. "
+        "Inspect the model architecture before continuing."
+    )
+
+backbone.head = nn.Identity()
+
+if not hasattr(backbone, "num_features"):
+    raise AttributeError(
+        "The model does not expose num_features."
+    )
+
+FEATURE_DIM = int(backbone.num_features)
+
+print("Backbone loaded successfully.")
 print("Feature dimension:", FEATURE_DIM)
 
 
 # ============================================================
-# 9. CLASSIFICATION MODEL
+# 10. CLASSIFICATION MODEL
 # ============================================================
 
-class CTransPathHER2(nn.Module):
-    def __init__(self, backbone, feature_dim, num_classes=4):
+class CTransPathClassifier(nn.Module):
+
+    def __init__(self, backbone, feature_dim, num_classes):
         super().__init__()
 
         self.backbone = backbone
-        self.classifier = nn.Linear(feature_dim, num_classes)
+
+        # Swin feature maps: [B, H, W, C]
+        # Global average pooling over spatial dimensions.
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Linear(
+            feature_dim,
+            num_classes,
+        )
 
     def forward(self, x):
         features = self.backbone(x)
 
-        if features.ndim > 2:
+        if features.ndim == 4:
+            # NHWC -> NCHW
+            features = features.permute(0, 3, 1, 2)
+
+            # [B, C, H, W] -> [B, C, 1, 1]
+            features = self.pool(features)
+
+            # [B, C, 1, 1] -> [B, C]
             features = torch.flatten(features, start_dim=1)
+
+        elif features.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected backbone output shape: "
+                f"{tuple(features.shape)}"
+            )
 
         logits = self.classifier(features)
 
         return logits
 
 
-model = CTransPathHER2(
+model = CTransPathClassifier(
     backbone=backbone,
     feature_dim=FEATURE_DIM,
-    num_classes=len(CLASS_NAMES)
+    num_classes=NUM_CLASSES,
 ).to(DEVICE)
 
-# Verify the complete model output.
+
+# ============================================================
+# 11. VERIFY FORWARD PASS AND TRAINABLE PARAMETERS
+# ============================================================
+
 model.eval()
 
 with torch.no_grad():
-    dummy_logits = model(
-        torch.zeros(2, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+    dummy_input = torch.zeros(
+        2, 3, IMAGE_SIZE, IMAGE_SIZE,
+        device=DEVICE,
     )
 
-assert dummy_logits.shape == (2, 4), (
+    dummy_logits = model(dummy_input)
+
+assert tuple(dummy_logits.shape) == (2, NUM_CLASSES), (
     f"Unexpected output shape: {tuple(dummy_logits.shape)}"
 )
 
-print("\nModel output shape:", tuple(dummy_logits.shape))
-print("Backbone fine-tuning: YES")
+model.train()
+
+trainable_params = sum(
+    p.numel()
+    for p in model.parameters()
+    if p.requires_grad
+)
+
+total_params = sum(
+    p.numel()
+    for p in model.parameters()
+)
+
+print("\n" + "=" * 70)
+print("MODEL CHECK")
+print("=" * 70)
+
+print("Output shape:", tuple(dummy_logits.shape))
+print("Trainable parameters:", f"{trainable_params:,}")
+print("Total parameters:", f"{total_params:,}")
+
+assert trainable_params > 0
 
 
 # ============================================================
-# 10. LOSS, OPTIMIZER, AND SCHEDULER
+# 12. LOSS AND OPTIMIZER
 # ============================================================
 
-if USE_CLASS_WEIGHTS:
-    train_class_counts = (
-        train_df["label"]
-        .value_counts()
-        .reindex(range(len(CLASS_NAMES)), fill_value=0)
-        .to_numpy(dtype=np.float64)
-    )
-
-    if np.any(train_class_counts == 0):
-        raise RuntimeError(
-            "At least one class has no training samples."
-        )
-
-    class_weights = (
-        train_class_counts.sum()
-        / (len(CLASS_NAMES) * train_class_counts)
-    )
-
-    criterion = nn.CrossEntropyLoss(
-        weight=torch.tensor(
-            class_weights,
-            dtype=torch.float32,
-            device=DEVICE
-        )
-    )
-
-    print("Class-weighted CrossEntropy enabled.")
-    print("Class weights:", class_weights.tolist())
-
-else:
-    criterion = nn.CrossEntropyLoss()
-    print("Standard CrossEntropy enabled.")
+criterion = nn.CrossEntropyLoss()
 
 optimizer = torch.optim.AdamW(
     [
         {
             "params": model.backbone.parameters(),
-            "lr": BACKBONE_LR
+            "lr": BACKBONE_LR,
         },
         {
             "params": model.classifier.parameters(),
-            "lr": CLASSIFIER_LR
-        }
+            "lr": CLASSIFIER_LR,
+        },
     ],
-    weight_decay=WEIGHT_DECAY
+    weight_decay=WEIGHT_DECAY,
 )
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode="max",
     factor=0.5,
-    patience=2
+    patience=2,
+    min_lr=1e-7,
 )
 
-# Mixed precision for GPU memory and speed.
-scaler = torch.cuda.amp.GradScaler(enabled=True)
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=USE_AMP,
+)
 
 
 # ============================================================
-# 11. EPOCH FUNCTION
+# 13. TRAINING AND EVALUATION FUNCTIONS
 # ============================================================
 
-def run_epoch(model, loader, training):
-    model.train(training)
+def run_epoch(model, loader, optimizer=None):
+    """
+    If optimizer is provided, perform one training epoch.
+    Otherwise, evaluate without gradient updates.
+    """
 
-    total_loss = 0.0
-    all_labels = []
+    training = optimizer is not None
+
+    if training:
+        model.train()
+    else:
+        model.eval()
+
+    running_loss = 0.0
+    all_targets = []
     all_predictions = []
 
-    for images, labels in loader:
+    for images, targets in loader:
         images = images.to(
             DEVICE,
-            non_blocking=True
+            non_blocking=True,
         )
 
-        labels = labels.to(
+        targets = targets.to(
             DEVICE,
-            non_blocking=True
+            non_blocking=True,
         )
 
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(training):
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.amp.autocast(
+                device_type=DEVICE.type,
+                enabled=USE_AMP,
+            ):
                 logits = model(images)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, targets)
 
             if training:
                 scaler.scale(loss).backward()
 
-                scaler.unscale_(optimizer)
-
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_norm=1.0
-                )
-
                 scaler.step(optimizer)
                 scaler.update()
 
-        total_loss += loss.detach().item() * labels.size(0)
+        batch_size = images.size(0)
 
-        predictions = logits.argmax(dim=1)
+        running_loss += loss.item() * batch_size
 
-        all_labels.extend(
-            labels.detach().cpu().numpy().tolist()
+        predictions = torch.argmax(
+            logits.detach(),
+            dim=1,
+        )
+
+        all_targets.extend(
+            targets.detach().cpu().numpy().tolist()
         )
 
         all_predictions.extend(
-            predictions.detach().cpu().numpy().tolist()
+            predictions.cpu().numpy().tolist()
         )
 
-    average_loss = total_loss / len(loader.dataset)
+    mean_loss = running_loss / len(loader.dataset)
 
-    metrics = {
-        "loss": float(average_loss),
-        "accuracy": float(
-            accuracy_score(all_labels, all_predictions)
-        ),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(all_labels, all_predictions)
-        ),
-        "macro_f1": float(
-            f1_score(
-                all_labels,
-                all_predictions,
-                average="macro",
-                zero_division=0
-            )
-        ),
-        "weighted_f1": float(
-            f1_score(
-                all_labels,
-                all_predictions,
-                average="weighted",
-                zero_division=0
-            )
-        )
+    accuracy = accuracy_score(
+        all_targets,
+        all_predictions,
+    )
+
+    macro_f1 = f1_score(
+        all_targets,
+        all_predictions,
+        labels=list(range(NUM_CLASSES)),
+        average="macro",
+        zero_division=0,
+    )
+
+    weighted_f1 = f1_score(
+        all_targets,
+        all_predictions,
+        labels=list(range(NUM_CLASSES)),
+        average="weighted",
+        zero_division=0,
+    )
+
+    balanced_acc = balanced_accuracy_score(
+        all_targets,
+        all_predictions,
+    )
+
+    return {
+        "loss": mean_loss,
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_acc,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "targets": all_targets,
+        "predictions": all_predictions,
     }
-
-    return metrics
 
 
 # ============================================================
-# 12. TRAINING LOOP
+# 14. TRAINING LOOP
 # ============================================================
 
 print("\n" + "=" * 70)
-print("STARTING CTRanSPATH FINE-TUNING")
+print("STARTING FINE-TUNING")
 print("=" * 70)
 
-history = []
+print("Epochs:", NUM_EPOCHS)
+print("Backbone LR:", BACKBONE_LR)
+print("Classifier LR:", CLASSIFIER_LR)
+print("Batch size:", BATCH_SIZE)
+print("Loss: unweighted CrossEntropyLoss")
+print("Checkpoint criterion: Validation Macro F1")
+
 best_val_macro_f1 = -1.0
 best_epoch = 0
 epochs_without_improvement = 0
 
+history = []
+
 start_time = time.time()
 
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(1, NUM_EPOCHS + 1):
 
     epoch_start = time.time()
 
     train_metrics = run_epoch(
         model,
         train_loader,
-        training=True
+        optimizer=optimizer,
     )
 
     val_metrics = run_epoch(
         model,
         val_loader,
-        training=False
+        optimizer=None,
     )
 
     scheduler.step(val_metrics["macro_f1"])
 
-    record = {
+    backbone_lr_now = optimizer.param_groups[0]["lr"]
+    classifier_lr_now = optimizer.param_groups[1]["lr"]
+
+    epoch_duration = time.time() - epoch_start
+
+    row = {
         "epoch": epoch,
-        **{
-            f"train_{key}": value
-            for key, value in train_metrics.items()
-        },
-        **{
-            f"val_{key}": value
-            for key, value in val_metrics.items()
-        }
+
+        "train_loss": train_metrics["loss"],
+        "train_accuracy": train_metrics["accuracy"],
+        "train_balanced_accuracy": (
+            train_metrics["balanced_accuracy"]
+        ),
+        "train_macro_f1": train_metrics["macro_f1"],
+        "train_weighted_f1": train_metrics["weighted_f1"],
+
+        "val_loss": val_metrics["loss"],
+        "val_accuracy": val_metrics["accuracy"],
+        "val_balanced_accuracy": (
+            val_metrics["balanced_accuracy"]
+        ),
+        "val_macro_f1": val_metrics["macro_f1"],
+        "val_weighted_f1": val_metrics["weighted_f1"],
+
+        "backbone_lr": backbone_lr_now,
+        "classifier_lr": classifier_lr_now,
+        "epoch_seconds": epoch_duration,
     }
 
-    history.append(record)
+    history.append(row)
 
     pd.DataFrame(history).to_csv(
         HISTORY_PATH,
-        index=False
-    )
-
-    elapsed_epoch = time.time() - epoch_start
-
-    print(
-        f"\nEpoch {epoch:02d}/{EPOCHS} | "
-        f"Time: {elapsed_epoch:.1f}s"
+        index=False,
     )
 
     print(
-        f"Train Loss: {train_metrics['loss']:.4f} | "
-        f"Train Acc: {train_metrics['accuracy']:.4f} | "
-        f"Train Macro F1: {train_metrics['macro_f1']:.4f}"
+        f"\nEpoch [{epoch:02d}/{NUM_EPOCHS}] "
+        f"| {epoch_duration:.1f}s"
     )
 
     print(
-        f"Val Loss: {val_metrics['loss']:.4f} | "
-        f"Val Acc: {val_metrics['accuracy']:.4f} | "
-        f"Val Balanced Acc: {val_metrics['balanced_accuracy']:.4f} | "
-        f"Val Macro F1: {val_metrics['macro_f1']:.4f}"
+        f"Train: loss={train_metrics['loss']:.4f}, "
+        f"acc={train_metrics['accuracy']:.4f}, "
+        f"macro-F1={train_metrics['macro_f1']:.4f}"
     )
 
+    print(
+        f"Val:   loss={val_metrics['loss']:.4f}, "
+        f"acc={val_metrics['accuracy']:.4f}, "
+        f"balanced-acc={val_metrics['balanced_accuracy']:.4f}, "
+        f"macro-F1={val_metrics['macro_f1']:.4f}, "
+        f"weighted-F1={val_metrics['weighted_f1']:.4f}"
+    )
+
+    print(
+        f"LR: backbone={backbone_lr_now:.2e}, "
+        f"classifier={classifier_lr_now:.2e}"
+    )
+
+    # Always save the latest training state.
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_macro_f1": best_val_macro_f1,
+            "class_names": CLASS_NAMES,
+            "model_id": MODEL_ID,
+            "seed": SEED,
+        },
+        LAST_MODEL_PATH,
+    )
+
+    # Select the best checkpoint using validation macro-F1.
     if val_metrics["macro_f1"] > best_val_macro_f1:
+
         best_val_macro_f1 = val_metrics["macro_f1"]
         best_epoch = epoch
         epochs_without_improvement = 0
@@ -697,338 +942,366 @@ for epoch in range(1, EPOCHS + 1):
             {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "val_metrics": val_metrics,
+                "best_val_macro_f1": best_val_macro_f1,
                 "class_names": CLASS_NAMES,
-                "seed": SEED,
+                "model_id": MODEL_ID,
                 "feature_dim": FEATURE_DIM,
-                "use_class_weights": USE_CLASS_WEIGHTS
+                "seed": SEED,
             },
-            BEST_CHECKPOINT
+            BEST_MODEL_PATH,
         )
 
-        print("  -> Best checkpoint saved.")
+        print(
+            f"Best checkpoint updated: "
+            f"val_macro_f1={best_val_macro_f1:.4f}"
+        )
 
     else:
         epochs_without_improvement += 1
 
-    if epochs_without_improvement >= PATIENCE:
         print(
-            f"\nEarly stopping: no improvement for "
-            f"{PATIENCE} consecutive epochs."
+            "No validation Macro F1 improvement: "
+            f"{epochs_without_improvement}/{PATIENCE}"
         )
+
+    if epochs_without_improvement >= PATIENCE:
+        print("\nEarly stopping triggered.")
         break
 
-total_training_time = time.time() - start_time
+
+training_duration = time.time() - start_time
 
 print("\n" + "=" * 70)
-print("TRAINING COMPLETED")
+print("TRAINING FINISHED")
 print("=" * 70)
 
 print("Best epoch:", best_epoch)
-print("Best Validation Macro F1:", round(best_val_macro_f1, 4))
-print("Training time (minutes):", round(total_training_time / 60, 2))
-print("Checkpoint:", BEST_CHECKPOINT)
+print("Best validation Macro F1:", f"{best_val_macro_f1:.4f}")
+print("Training duration (minutes):", f"{training_duration / 60:.2f}")
+print("Best checkpoint:", BEST_MODEL_PATH)
 
 
 # ============================================================
-# 13. LOAD BEST CHECKPOINT
+# 15. LOAD THE BEST VALIDATION CHECKPOINT
 # ============================================================
 
-if not BEST_CHECKPOINT.exists():
+if not BEST_MODEL_PATH.is_file():
     raise FileNotFoundError(
-        "Best checkpoint was not created. Training may have failed."
+        "Best model checkpoint was not created."
     )
 
 try:
-    best_saved = torch.load(
-        BEST_CHECKPOINT,
+    best_checkpoint = torch.load(
+        BEST_MODEL_PATH,
         map_location=DEVICE,
-        weights_only=False
+        weights_only=True,
     )
 except TypeError:
-    best_saved = torch.load(
-        BEST_CHECKPOINT,
-        map_location=DEVICE
+    # Compatibility fallback for PyTorch versions that do not
+    # expose the weights_only argument.
+    best_checkpoint = torch.load(
+        BEST_MODEL_PATH,
+        map_location=DEVICE,
     )
 
 model.load_state_dict(
-    best_saved["model_state_dict"],
-    strict=True
+    best_checkpoint["model_state_dict"],
+    strict=True,
 )
 
-model.eval()
-
-print("\nLoaded best checkpoint from epoch:", best_saved["epoch"])
+print("\nLoaded best checkpoint from epoch:", best_checkpoint["epoch"])
+print(
+    "Checkpoint validation Macro F1:",
+    f"{best_checkpoint['best_val_macro_f1']:.4f}",
+)
 
 
 # ============================================================
-# 14. FINAL TEST EVALUATION
+# 16. FINAL TEST EVALUATION
 # ============================================================
 
-# Test set is evaluated only after checkpoint selection.
-test_true = []
-test_pred = []
-test_prob = []
+# Test is evaluated only after checkpoint selection.
+# Do not change hyperparameters based on these results.
 
-with torch.no_grad():
-    for images, labels in test_loader:
-        images = images.to(
-            DEVICE,
-            non_blocking=True
-        )
+print("\n" + "=" * 70)
+print("FINAL TEST EVALUATION")
+print("=" * 70)
 
-        with torch.cuda.amp.autocast(enabled=True):
-            logits = model(images)
-
-        probabilities = torch.softmax(
-            logits.float(),
-            dim=1
-        )
-
-        predictions = probabilities.argmax(dim=1)
-
-        test_true.extend(labels.numpy().tolist())
-        test_pred.extend(predictions.cpu().numpy().tolist())
-        test_prob.extend(probabilities.cpu().numpy().tolist())
-
-
-# Final metrics
-test_metrics = {
-    "best_epoch": int(best_saved["epoch"]),
-    "accuracy": float(
-        accuracy_score(test_true, test_pred)
-    ),
-    "balanced_accuracy": float(
-        balanced_accuracy_score(test_true, test_pred)
-    ),
-    "macro_f1": float(
-        f1_score(
-            test_true,
-            test_pred,
-            average="macro",
-            zero_division=0
-        )
-    ),
-    "weighted_f1": float(
-        f1_score(
-            test_true,
-            test_pred,
-            average="weighted",
-            zero_division=0
-        )
-    )
-}
-
-report_text = classification_report(
-    test_true,
-    test_pred,
-    labels=[0, 1, 2, 3],
-    target_names=CLASS_NAMES,
-    zero_division=0
+test_metrics = run_epoch(
+    model,
+    test_loader,
+    optimizer=None,
 )
 
-report_dict = classification_report(
-    test_true,
-    test_pred,
-    labels=[0, 1, 2, 3],
-    target_names=CLASS_NAMES,
-    output_dict=True,
-    zero_division=0
+y_true = np.asarray(test_metrics["targets"])
+y_pred = np.asarray(test_metrics["predictions"])
+
+test_accuracy = accuracy_score(
+    y_true,
+    y_pred,
 )
 
-cm = confusion_matrix(
-    test_true,
-    test_pred,
-    labels=[0, 1, 2, 3]
+test_balanced_accuracy = balanced_accuracy_score(
+    y_true,
+    y_pred,
+)
+
+test_macro_f1 = f1_score(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
+    average="macro",
+    zero_division=0,
+)
+
+test_weighted_f1 = f1_score(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
+    average="weighted",
+    zero_division=0,
+)
+
+test_macro_precision = precision_score(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
+    average="macro",
+    zero_division=0,
+)
+
+test_macro_recall = recall_score(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
+    average="macro",
+    zero_division=0,
+)
+
+print(f"Test Loss:              {test_metrics['loss']:.4f}")
+print(f"Test Accuracy:          {test_accuracy:.4f}")
+print(f"Test Balanced Accuracy: {test_balanced_accuracy:.4f}")
+print(f"Test Macro Precision:   {test_macro_precision:.4f}")
+print(f"Test Macro Recall:      {test_macro_recall:.4f}")
+print(f"Test Macro F1:          {test_macro_f1:.4f}")
+print(f"Test Weighted F1:       {test_weighted_f1:.4f}")
+
+
+# ============================================================
+# 17. CLASSIFICATION REPORT
+# ============================================================
+
+report = classification_report(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
+    target_names=CLASS_NAMES,
+    digits=4,
+    zero_division=0,
 )
 
 print("\n" + "=" * 70)
-print("CTRanSPATH — FINAL TEST RESULTS")
+print("CLASSIFICATION REPORT")
 print("=" * 70)
 
-for key, value in test_metrics.items():
-    if key == "best_epoch":
-        print(f"{key:22s}: {value}")
-    else:
-        print(
-            f"{key:22s}: {value:.4f} "
-            f"({value * 100:.2f}%)"
-        )
-
-print("\nClassification report:")
-print(report_text)
-
-print("Confusion matrix (rows=true, columns=predicted):")
-
-cm_df = pd.DataFrame(
-    cm,
-    index=[f"true_{c}" for c in CLASS_NAMES],
-    columns=[f"pred_{c}" for c in CLASS_NAMES]
-)
-
-print(cm_df)
-
-
-# ============================================================
-# 15. SAVE METRICS, REPORT, CONFUSION MATRIX, PREDICTIONS
-# ============================================================
+print(report)
 
 with open(
-    OUTPUT_DIR / "test_metrics.json",
+    REPORT_PATH,
     "w",
-    encoding="utf-8"
-) as f:
-    json.dump(
-        test_metrics,
-        f,
-        indent=2,
-        ensure_ascii=False
+    encoding="utf-8",
+) as file:
+    file.write("CTransPath — Path B\n")
+    file.write(f"Best epoch: {best_epoch}\n")
+    file.write(
+        f"Best validation Macro F1: "
+        f"{best_val_macro_f1:.6f}\n\n"
     )
 
-pd.DataFrame(report_dict).transpose().to_csv(
-    OUTPUT_DIR / "classification_report.csv"
-)
-
-cm_df.to_csv(
-    OUTPUT_DIR / "confusion_matrix.csv"
-)
-
-# test_loader uses shuffle=False, so prediction order corresponds
-# to the order of test_df.
-predictions_df = pd.DataFrame({
-    "image_name": test_df["image_name"].tolist(),
-    "true_label_id": test_true,
-    "true_label": [
-        ID_TO_LABEL[x] for x in test_true
-    ],
-    "predicted_label_id": test_pred,
-    "predicted_label": [
-        ID_TO_LABEL[x] for x in test_pred
-    ],
-    "correct": [
-        int(t == p)
-        for t, p in zip(test_true, test_pred)
-    ]
-})
-
-for i, class_name in enumerate(CLASS_NAMES):
-    predictions_df[f"prob_{class_name}"] = [
-        float(row[i]) for row in test_prob
-    ]
-
-predictions_df.to_csv(
-    OUTPUT_DIR / "test_predictions.csv",
-    index=False
-)
+    file.write(report)
 
 
 # ============================================================
-# 16. SAVE CONFUSION MATRIX FIGURE
+# 18. CONFUSION MATRIX
 # ============================================================
 
-plt.figure(figsize=(8, 6))
-
-sns.heatmap(
-    cm,
-    annot=True,
-    fmt="d",
-    cmap="Blues",
-    xticklabels=CLASS_NAMES,
-    yticklabels=CLASS_NAMES
+cm = confusion_matrix(
+    y_true,
+    y_pred,
+    labels=list(range(NUM_CLASSES)),
 )
 
-plt.xlabel("Predicted label")
-plt.ylabel("True label")
-plt.title("CTransPath — Test Confusion Matrix")
-plt.tight_layout()
+print("\nConfusion Matrix:")
+print(cm)
 
-plt.savefig(
-    OUTPUT_DIR / "confusion_matrix.png",
-    dpi=200,
-    bbox_inches="tight"
+disp = ConfusionMatrixDisplay(
+    confusion_matrix=cm,
+    display_labels=CLASS_NAMES,
+)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+
+disp.plot(
+    ax=ax,
+    values_format="d",
+    colorbar=False,
+)
+
+ax.set_title("CTransPath — Test Confusion Matrix")
+ax.set_xlabel("Predicted label")
+ax.set_ylabel("True label")
+
+fig.tight_layout()
+
+fig.savefig(
+    CONFUSION_MATRIX_PATH,
+    dpi=300,
+    bbox_inches="tight",
 )
 
 plt.show()
-plt.close()
+plt.close(fig)
 
 
 # ============================================================
-# 17. SAVE TRAINING CURVES
+# 19. SAVE TEST PREDICTIONS
 # ============================================================
 
-history_df = pd.DataFrame(history)
-history_df.to_csv(HISTORY_PATH, index=False)
+probabilities = []
 
-if not history_df.empty:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+model.eval()
 
-    axes[0].plot(
-        history_df["epoch"],
-        history_df["train_loss"],
-        label="Train"
+with torch.no_grad():
+    for images, _ in test_loader:
+        images = images.to(
+            DEVICE,
+            non_blocking=True,
+        )
+
+        with torch.amp.autocast(
+            device_type=DEVICE.type,
+            enabled=USE_AMP,
+        ):
+            logits = model(images)
+
+        probs = torch.softmax(logits.float(), dim=1)
+
+        probabilities.extend(
+            probs.cpu().numpy().tolist()
+        )
+
+probabilities = np.asarray(probabilities)
+
+prediction_df = test_df.reset_index(drop=True).copy()
+
+prediction_df["true_label"] = [
+    CLASS_NAMES[i] for i in y_true
+]
+
+prediction_df["predicted_label"] = [
+    CLASS_NAMES[i] for i in y_pred
+]
+
+prediction_df["correct"] = (
+    prediction_df["label"].to_numpy() == y_pred
+)
+
+for class_idx, class_name in enumerate(CLASS_NAMES):
+    prediction_df[f"prob_{class_name}"] = (
+        probabilities[:, class_idx]
     )
 
-    axes[0].plot(
-        history_df["epoch"],
-        history_df["val_loss"],
-        label="Validation"
-    )
-
-    axes[0].set_title("Loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend()
-
-    axes[1].plot(
-        history_df["epoch"],
-        history_df["train_macro_f1"],
-        label="Train"
-    )
-
-    axes[1].plot(
-        history_df["epoch"],
-        history_df["val_macro_f1"],
-        label="Validation"
-    )
-
-    axes[1].set_title("Macro F1")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Macro F1")
-    axes[1].legend()
-
-    plt.tight_layout()
-
-    plt.savefig(
-        OUTPUT_DIR / "training_curves.png",
-        dpi=200,
-        bbox_inches="tight"
-    )
-
-    plt.show()
-    plt.close()
+prediction_df.to_csv(
+    PREDICTIONS_PATH,
+    index=False,
+)
 
 
 # ============================================================
-# 18. FINAL SUMMARY
+# 20. SAVE METRICS AS JSON
+# ============================================================
+
+metrics = {
+    "model": "CTransPath",
+    "experiment": "Path B — End-to-End Fine-Tuning",
+
+    "pretrained_model_id": MODEL_ID,
+
+    "dataset_root": str(DATA_ROOT),
+
+    "num_train_images": int(len(train_df)),
+    "num_validation_images": int(len(val_df)),
+    "num_test_images": int(len(test_df)),
+
+    "class_names": CLASS_NAMES,
+
+    "best_epoch": int(best_epoch),
+    "best_validation_macro_f1": float(best_val_macro_f1),
+
+    "test_loss": float(test_metrics["loss"]),
+    "test_accuracy": float(test_accuracy),
+    "test_balanced_accuracy": float(test_balanced_accuracy),
+    "test_macro_precision": float(test_macro_precision),
+    "test_macro_recall": float(test_macro_recall),
+    "test_macro_f1": float(test_macro_f1),
+    "test_weighted_f1": float(test_weighted_f1),
+
+    "confusion_matrix": cm.tolist(),
+
+    "backbone_learning_rate": BACKBONE_LR,
+    "classifier_learning_rate": CLASSIFIER_LR,
+    "batch_size": BATCH_SIZE,
+    "image_size": IMAGE_SIZE,
+    "weight_decay": WEIGHT_DECAY,
+    "class_weights_used": USE_CLASS_WEIGHTS,
+    "seed": SEED,
+
+    "training_duration_minutes": float(
+        training_duration / 60
+    ),
+
+    "best_checkpoint": str(BEST_MODEL_PATH),
+}
+
+with open(
+    METRICS_PATH,
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        metrics,
+        file,
+        indent=4,
+        ensure_ascii=False,
+    )
+
+
+# ============================================================
+# 21. FINAL SUMMARY
 # ============================================================
 
 print("\n" + "=" * 70)
-print("CTRanSPATH EXPERIMENT COMPLETED")
+print("FINAL SUMMARY")
 print("=" * 70)
 
-print("\nFinal Test metrics:")
-for key, value in test_metrics.items():
-    print(f"{key}: {value}")
+print(f"Best epoch:              {best_epoch}")
+print(f"Best validation Macro F1:{best_val_macro_f1: .4f}")
+print(f"Test Accuracy:           {test_accuracy:.4f}")
+print(f"Test Balanced Accuracy:  {test_balanced_accuracy:.4f}")
+print(f"Test Macro F1:            {test_macro_f1:.4f}")
+print(f"Test Weighted F1:         {test_weighted_f1:.4f}")
 
 print("\nSaved files:")
 
-for path in sorted(OUTPUT_DIR.iterdir()):
-    if path.is_file():
-        print(
-            f"{path.name:40s} "
-            f"{path.stat().st_size / 1024:.1f} KB"
-        )
+for path in [
+    BEST_MODEL_PATH,
+    LAST_MODEL_PATH,
+    HISTORY_PATH,
+    METRICS_PATH,
+    REPORT_PATH,
+    PREDICTIONS_PATH,
+    CONFUSION_MATRIX_PATH,
+]:
+    print(f"- {path}")
 
-print("\nOutput directory:", OUTPUT_DIR)
-print("Best checkpoint:", BEST_CHECKPOINT)
-print("CTransPath Test evaluation completed.")
+print("\nCTransPath Path B completed.")
